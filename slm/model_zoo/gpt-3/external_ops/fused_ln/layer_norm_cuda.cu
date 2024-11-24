@@ -121,6 +121,13 @@ std::vector<paddle::DataType> RMSLnFwdInferDtype(paddle::DataType x_dtype,
   return {x_dtype, paddle::DataType::FLOAT32};
 }
 
+std::vector<paddle::DataType> RMSLnBwdInferDtype(paddle::DataType x_dtype,
+                                                 paddle::DataType scale_dtype,
+                                                 paddle::DataType invvar_dtype,
+                                                 paddle::DataType dy_dtype) {
+  return {x_dtype, paddle::DataType::FLOAT32};
+}
+
 std::vector<paddle::Tensor> LnBwd(const paddle::Tensor &x,
                                   const paddle::Tensor &scale,
                                   const paddle::Tensor &bias,
@@ -226,12 +233,24 @@ PD_BUILD_OP(fused_rms_norm)
 #endif
     ;
 
-PD_BUILD_GRAD_OP(fused_rms_norm)
+// PD_BUILD_GRAD_OP(fused_rms_norm)
+//     .Inputs({"x", "scale", "invvar", paddle::Grad("y")})
+//     .Outputs({paddle::Grad("x"), paddle::Grad("scale")})
+//     .Attrs({"epsilon: float"})
+//     .SetKernelFn(PD_KERNEL(RMSLnBwd))
+//     .SetInferShapeFn(PD_INFER_SHAPE(RMSLnBwdInferShape))
+// #ifdef CUSTOM_OP_WITH_SPMD
+//     .SetInferSpmdFn(PD_INFER_SPMD_RULE(phi::distributed::RmsNormGradInferSpmd))
+// #endif
+//     ;
+
+PD_BUILD_OP(fused_rms_norm_G)
     .Inputs({"x", "scale", "invvar", paddle::Grad("y")})
     .Outputs({paddle::Grad("x"), paddle::Grad("scale")})
     .Attrs({"epsilon: float"})
     .SetKernelFn(PD_KERNEL(RMSLnBwd))
     .SetInferShapeFn(PD_INFER_SHAPE(RMSLnBwdInferShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(RMSLnBwdInferDtype))
 #ifdef CUSTOM_OP_WITH_SPMD
     .SetInferSpmdFn(PD_INFER_SPMD_RULE(phi::distributed::RmsNormGradInferSpmd))
 #endif
