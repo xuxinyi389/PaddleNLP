@@ -48,7 +48,14 @@ ckpt_path='/path/for/dist_ckpt'
 merged_state_dict = dist.checkpoint.load_state_dict.load_merged_state_dict(ckpt_path, offload=1)
 paddle.save(unsharded_state_dict, 'model_state.pdparams')
 
-# 当前支持的模型参数文件为 `model_state.pdparams`，后续会支持unified_checkpoint格式的模型参数文件。
+# 上述合并的模型参数格式为Paddle原生格式，如需转换为unified_param格式(safetensors)，可继续执行如下代码：
+python PaddleNLP/llm/auto_parallel/tools/convert_to_safetensors.py --input_path input_path  [--output_path output_path] [--split_num split_num] [--offload offload]
+
+# 参数介绍
+--input_path: 输入的单卡模型参数路径
+--output_path: 可选，输出模型参数路径，默认为'./temp'
+--split_num: 可选，输出的模型参数分片数，默认为 1
+--offload: 可选，是否将参数 offload 到 CPU，默认为 false
 ```
 
 - 动态图推理
