@@ -100,6 +100,8 @@ class CheckpointConverter:
                     self.local_view_pattern_list = local_view_pattern
                 else:
                     self.local_view_pattern_list = ["experts"]
+        else:
+            self.local_view_pattern_list = None
 
         flags = [
             ["tp degree", self.tp_degree],
