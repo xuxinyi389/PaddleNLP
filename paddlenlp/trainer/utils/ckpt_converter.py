@@ -992,7 +992,7 @@ class CheckpointConverter:
             if self.is_sharding_stage3 or (self.sharding_degree > 1 and self.sharding_stage1_v == 2):
                 assert len(old_names) == len(model_state_keys)
 
-            # NOTE: Handing the case where the number of master_weight elements is not equal to the number of model_state_keys.
+            # NOTE: Handle the case where the number of master_weight elements is not equal to the number of model_state_keys.
             if suffix != ".master_weight":
                 for i in range(len(old_names)):
                     name_mapping[old_names[i]] = model_state_keys[i] + suffix
