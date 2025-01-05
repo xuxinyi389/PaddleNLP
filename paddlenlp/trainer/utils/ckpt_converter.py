@@ -954,7 +954,7 @@ class CheckpointConverter:
 
         for key, value in state_dict.items():
             # NOTE: Skip the parameters that are not initialized，which are not in the current rank.
-            if not value._is_initialized():
+            if value is None or (isinstance(value, paddle.Tensor) and not value._is_initialized()):
                 continue
             if key in parameter_to_structured_name.values():
                 new_name = key
