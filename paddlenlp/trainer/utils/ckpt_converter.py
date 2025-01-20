@@ -36,7 +36,6 @@ SCHEDULER_NAME = "scheduler.pdparams"
 SCALAR_NAME = "scalar.pdparams"
 MODEL_META_FILE_NAME = "model_meta.json"
 OPTIMIZER_STATE_NAME_SUFFIX = [".moment1", ".moment2", ".beta1_pow_acc", ".beta2_pow_acc", ".master_weight"]
-MODEL_STATE_FILE_MIN_SIZE = 512
 
 
 class CheckpointConverter:
@@ -74,6 +73,8 @@ class CheckpointConverter:
 
         self.is_model_meta_exists = self.get_is_model_meta_exists_flag()
         self.is_model_state_stored = self.get_is_model_state_stored_flag()
+        # assign the value of is_model_state_stored is_model_state_complete.
+        self.is_model_state_complete = self.is_model_state_stored
 
         self.initial_distributed_configuration()
 
@@ -100,8 +101,6 @@ class CheckpointConverter:
                     self.local_view_pattern_list = local_view_pattern
                 else:
                     self.local_view_pattern_list = ["experts"]
-        else:
-            self.local_view_pattern_list = None
 
         flags = [
             ["tp degree", self.tp_degree],
@@ -127,20 +126,31 @@ class CheckpointConverter:
 
         metadata, source_state_dict = self.gen_metadata_and_prepare_source_state_dict()
         logger.info("Generated the checkpoint’s metadata.")
-        logger.debug(f"The checkpoint's metadata is {metadata}.")
-        if not self.is_model_state_stored:
-            assert self.optimizer_state_with_master_weights
-            model_params = {}
+        logger.info(f"The checkpoint's metadata is {metadata}.")
+        if self.is_model_state_complete:
+            self.is_model_state_complete = self.get_is_model_state_complete_flag(
+                self.auto_parallel_state_dict, metadata
+            )
+        logger.debug("The Flag of is_model_state_stored: ", self.is_model_state_stored)
+        if not self.is_model_state_stored or not self.is_model_state_complete:
+            # assert self.optimizer_state_with_master_weights，
+            model_params_to_assign = {}
+            logger.info("Load model parameters using master_weight")
+            metadata_keys = set(metadata.state_dict_metadata.keys())
+            logger.debug(f"metadata_keys:{metadata_keys}")
+            # NOTE: In Automatic Mixed Precision (AMP) training, not all optimizer states are stored in bfloat16 format.
             for state_name, state_value in self.auto_parallel_state_dict.items():
                 self.auto_parallel_state_dict[state_name] = state_value.cuda()
-                if state_name in self.parameter_to_structured_name.values():
-                    model_params[state_name] = state_value
-            for param_name in model_params.keys():
+                if state_name in self.parameter_to_structured_name.values() and state_name not in metadata_keys:
+                    model_params_to_assign[state_name] = state_value
+                    logger.debug(f"push {state_name} into model_params_to_assign")
+
+            for param_name in model_params_to_assign.keys():
                 self.auto_parallel_state_dict.pop(param_name)
 
             logger.info("Requesting GPU memory space to load master_weights.")
             appended_master_weight_names = []
-            for param_name, param_value in model_params.items():
+            for param_name, param_value in model_params_to_assign.items():
                 master_weight = param_name + ".master_weight"
                 if master_weight not in self.auto_parallel_state_dict:
                     appended_master_weight_names.append(master_weight)
@@ -165,12 +175,27 @@ class CheckpointConverter:
             logger.info("Calling _load_state_dict completed, restored the required weights.")
 
             # In this scenario, the data type of the model state is bfloat16.
-            for param_name, param_value in model_params.items():
-                if param_value._is_initialized():
-                    # These codes are compatible for both dense tensor and dist tensor
-                    master_weight = self.auto_parallel_state_dict[param_name + ".master_weight"]
-                    cast_master_weight = paddle.cast(master_weight, param_value.dtype)
-                    paddle.assign(cast_master_weight, param_value)
+
+            model_params_keys = []
+            model_params_keys_list = []
+            for param_name in model_params_to_assign.keys():
+                model_params_keys.append(param_name)
+            model_params_keys_list = self.gather_global_object(model_params_keys)
+            model_params_keys_set = set(model_params_keys_list)
+            model_params_keys_list = list(model_params_keys_set)
+            model_params_keys_list.sort()
+
+            for param_name in model_params_keys_list:
+                logger.debug(f"Load the parameter name: {param_name}")
+                if param_name in model_params_to_assign:
+                    logger.debug(f"{param_name} not in curr rank")
+                    param_value = model_params_to_assign[param_name]
+                    if param_value._is_initialized():
+                        # These codes are compatible for both dense tensor and dist tensor
+                        master_weight = self.auto_parallel_state_dict[param_name + ".master_weight"]
+                        cast_master_weight = paddle.cast(master_weight, param_value.dtype)
+                        paddle.assign(cast_master_weight, param_value)
+                paddle.distributed.barrier()
             for master_weight_name in appended_master_weight_names:
                 self.auto_parallel_state_dict.pop(master_weight_name)
         else:
@@ -217,9 +242,10 @@ class CheckpointConverter:
 
             metadata_for_merge_sharding = Metadata(state_dict_metadata, storage_metadata, None)
 
-            logger.debug(f"The metadata for merge sharding is: {metadata_for_merge_sharding}")
+            logger.info(f"The metadata for merge sharding is: {metadata_for_merge_sharding}")
 
             source_state_dict_for_merge_sharding = {}
+            model_state_dict_for_patch = {}
             for file_name, state_dict in self.cur_rank_loaded_state_dict.items():
                 renamed_state_dict = {}
                 (tp_rank, pp_rank, sharding_rank) = self.get_distribution_rank_from_file_name(file_name)
@@ -228,6 +254,10 @@ class CheckpointConverter:
                     renamed_state_dict[state_name_with_tp_rank] = state_value
 
                 source_state_dict_for_merge_sharding[file_name] = renamed_state_dict
+
+                if file_name.endswith(".pdparams"):
+                    for key in renamed_state_dict:
+                        model_state_dict_for_patch[key] = renamed_state_dict[key]
 
             assert self.model_meta is not None
             global_model_state_shapes = []
@@ -276,9 +306,9 @@ class CheckpointConverter:
                             (param_flattened_shapes[key],), "float32"
                         )
                         if self.optimizer_state_with_master_weights:
-                            optimizer_state_dict[key + ".master_weight" + tp_rank_suffix] = paddle.zeros(
-                                (param_flattened_shapes[key],), "float32"
-                            )
+                            mw_key = key + ".master_weight" + tp_rank_suffix
+                            if mw_key in metadata_for_merge_sharding.state_dict_metadata.keys():
+                                optimizer_state_dict[mw_key] = paddle.zeros((param_flattened_shapes[key],), "float32")
                         # When handling tensor parallelism (TP), if some tensors are replicated, we initially assume that they are partitioned.
                         # Later, when these are compared with the global shape, we realize that they are replicated.
 
@@ -298,6 +328,13 @@ class CheckpointConverter:
             )
             logger.info("Completed the call _load_state_dict, concating back the tensors split by sharding.")
 
+            if self.optimizer_state_with_master_weights:
+                # patch the model state parameters (usually used in amp, whose dtype is fp32 and not have master_weight in the optimizer)
+                for key in model_state_dict_for_patch.keys():
+                    if key not in optimizer_state_dict.keys():
+                        optimizer_state_dict[key] = paddle.to_tensor(model_state_dict_for_patch[key])
+                        logger.info(f"patch model state dict for {key}")
+
             # Reshape
             for opt_state_name, opt_state_value in optimizer_state_dict.items():
                 if opt_state_value.shape[0] > 1 and "_tp" in opt_state_name:
@@ -306,6 +343,8 @@ class CheckpointConverter:
                     assert opt_state_value.numel() == reduce(lambda x, y: x * y, param_shape)
                     reshaped_opt_state_value = opt_state_value.reshape(param_shape)
                     optimizer_state_dict[opt_state_name] = reshaped_opt_state_value
+            # support local view keys to global view keys in moe
+            optimizer_state_dict = self.rename_local_view_state_dict(optimizer_state_dict)
             concat_optimier_state_dict = {}
 
             optimizer_state_key_to_tp_keys = {}
@@ -514,15 +553,22 @@ class CheckpointConverter:
             else:
                 return self.gen_metadata_for_tp_sharded_tensor()
 
-    def rename_local_view_state_dict(self, state_dict, file_name):
+    def rename_local_view_state_dict(self, state_dict, file_name=None):
         """
         Rename the key for local views to the key for global views, and return the renamed `state_dict`.
         """
+        # the flag using when file_name is None
+        detect_tp_by_name = False
+
         if self.local_view_pattern_list is None:
             return state_dict
         # case 1: moe_group is mp_group
-        if self.tp_degree > 1 and self.sharding_degree <= 1:
-            (tp_rank, pp_rank, sharding_rank) = self.get_distribution_rank_from_file_name(file_name)
+        if self.tp_degree > 1:
+            if file_name:
+                (tp_rank, pp_rank, sharding_rank) = self.get_distribution_rank_from_file_name(file_name)
+            else:
+                logger.info("detecting tp_rank by key name")
+                tp_rank = None
             expert_name_old2new = {}
             for pattern in self.local_view_pattern_list:
                 expert_pattern = rf"({pattern}\.)(\d+)"
@@ -534,13 +580,26 @@ class CheckpointConverter:
                         expert_ids.add(int(res.group(2)))
                 expert_num = len(expert_ids)
                 # construct old name to new name mapping
+                if tp_rank is None:
+                    detect_tp_by_name = True
+
                 for state_name in state_dict.keys():
+                    # extract tp info from state_name
+                    if detect_tp_by_name:
+                        tp_pattern = r"(tp)(\d+)"
+                        res = re.search(tp_pattern, state_name)
+                        if res:
+                            curr_rank = int(res.group(2))
+                    else:
+                        curr_rank = tp_rank
+
                     res = re.search(expert_pattern, state_name)
                     if res:
-                        new_expert_id = int(res.group(2)) % expert_num + tp_rank * expert_num
+                        new_expert_id = int(res.group(2)) % expert_num + curr_rank * expert_num
                         expert_name_old2new[state_name] = re.sub(
                             expert_pattern, f"{res.group(1)}{new_expert_id}", state_name
                         )
+            logger.debug(f"mapping old experts name to new: {expert_name_old2new}")
             # rename state_dict
             renamed_state_dict = {
                 expert_name_old2new[state_name]
@@ -550,7 +609,6 @@ class CheckpointConverter:
             }
 
             return renamed_state_dict
-        # TODO: add support for sharding
         else:
             return state_dict
 
@@ -935,7 +993,7 @@ class CheckpointConverter:
         renamed_state_dict = {}
 
         def rename(old_name, parameter_to_structured_name):
-            for i in range(1, len(old_name) + 1):
+            for i in reversed(range(1, len(old_name) + 1)):
                 param_name = old_name[:i]  # param_name
                 suffix = old_name[i:]  # suffix
                 if param_name in parameter_to_structured_name:
@@ -1045,6 +1103,15 @@ class CheckpointConverter:
         return True in save_sharded_model_flag
 
     def get_is_model_state_stored_flag(self):
+        """
+        Check whether the model state file exists.
+
+        Note: This check may not always be accurate. When the model contains parameters of different precision (e.g.,
+        some are FP32 and others are BF16), the model state file may still exist even if the flag indicates otherwise.
+
+        Returns:
+            bool: True if the model state file exists, False otherwise.
+        """
         if len(self.global_model_state_file_names) == 0:
             return False
         model_state_file_name = self.global_model_state_file_names[0]
@@ -1054,11 +1121,38 @@ class CheckpointConverter:
         is_model_state_stored = False
         if self.cur_rank == coordinator_rank:
             model_state_file_size = os.path.getsize(os.path.join(self.path, model_state_file_name))
-            if model_state_file_size > MODEL_STATE_FILE_MIN_SIZE:
+            if model_state_file_size > 0:
                 is_model_state_stored = True
 
         is_model_state_stored_flags = self.gather_global_object([is_model_state_stored])
         return True in is_model_state_stored_flags
+
+    def get_is_model_state_complete_flag(self, model_state, meta_data):
+        """
+        Verify if the model state file is complete by comparing it with meta data.
+
+        Returns:
+            bool: True if the model state file is complete, False otherwise.
+        """
+        model_state_keys = set(model_state.keys())
+        meta_data_keys = set(meta_data.state_dict_metadata.keys())
+
+        missing_keys = model_state_keys - meta_data_keys
+        is_complete = len(missing_keys) == 0
+
+        # Log the results
+        logger.debug(f"Model state contains {len(model_state_keys)} parameters.")
+        logger.debug(f"Meta data contains {len(meta_data_keys)} parameters.")
+
+        if not is_complete:
+            for key in missing_keys:
+                if any(key.endswith(suffix) for suffix in OPTIMIZER_STATE_NAME_SUFFIX):
+                    logger.warning(f"The model state file missing optimizer state '{key}'.")
+
+            logger.warning(f"The model state file is incomplete. Missing parameters: {missing_keys}.")
+
+        is_complete_flags = self.gather_global_object([is_complete])
+        return all(is_complete_flags)
 
     def flatten_state_dict(self, state_dict):
         flattened_state_dict = {}
