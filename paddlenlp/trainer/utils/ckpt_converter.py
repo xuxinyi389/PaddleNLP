@@ -101,6 +101,8 @@ class CheckpointConverter:
                     self.local_view_pattern_list = local_view_pattern
                 else:
                     self.local_view_pattern_list = ["experts"]
+        else:
+            self.local_view_pattern_list = None
 
         flags = [
             ["tp degree", self.tp_degree],
@@ -126,7 +128,7 @@ class CheckpointConverter:
 
         metadata, source_state_dict = self.gen_metadata_and_prepare_source_state_dict()
         logger.info("Generated the checkpoint’s metadata.")
-        logger.info(f"The checkpoint's metadata is {metadata}.")
+        logger.debug(f"The checkpoint's metadata is {metadata}.")
         if self.is_model_state_complete:
             self.is_model_state_complete = self.get_is_model_state_complete_flag(
                 self.auto_parallel_state_dict, metadata
@@ -242,7 +244,7 @@ class CheckpointConverter:
 
             metadata_for_merge_sharding = Metadata(state_dict_metadata, storage_metadata, None)
 
-            logger.info(f"The metadata for merge sharding is: {metadata_for_merge_sharding}")
+            logger.debug(f"The metadata for merge sharding is: {metadata_for_merge_sharding}")
 
             source_state_dict_for_merge_sharding = {}
             model_state_dict_for_patch = {}
